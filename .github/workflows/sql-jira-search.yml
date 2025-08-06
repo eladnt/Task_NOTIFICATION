@@ -1,0 +1,553 @@
+# .github/workflows/sql-git-jira-search.yml
+name: SQL Server to Git-Jira Search
+
+on:
+  workflow_dispatch:  # Manual trigger
+  schedule:
+    - cron: '0 9 * * 1-5'  # Run at 9 AM on weekdays
+
+env:
+  SQL_SERVER: "ri70-sql"
+  DATABASE: "t3"
+  TABLE_NAME: "tmp_tasks"
+
+jobs:
+  fetch-and-search:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for git log searches
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+
+    - name: Install dependencies
+      run: |
+        npm init -y
+        npm install mssql
+
+    - name: Checkout additional repositories (if needed)
+      run: |
+        # Add any additional repositories that might contain Jira references
+        # Example: git clone https://github.com/yourorg/another-repo.git additional-repo
+
+    - name: Create Git-Jira search script
+      run: |
+        cat > search-git-jira-tasks.js << 'EOF'
+        const sql = require('mssql');
+        const { execSync } = require('child_process');
+        const fs = require('fs');
+        const path = require('path');
+
+        // Configuration
+        const sqlConfig = {
+          server: process.env.SQL_SERVER,
+          database: process.env.DATABASE,
+          user: process.env.SQL_USERNAME,
+          password: process.env.SQL_PASSWORD,
+          options: {
+            encrypt: true,
+            trustServerCertificate: true
+          }
+        };
+
+        async function getTasksFromSQL() {
+          try {
+            console.log('Connecting to SQL Server...');
+            await sql.connect(sqlConfig);
+            
+            const result = await sql.query`SELECT DISTINCT task_no FROM ${process.env.TABLE_NAME} WHERE task_no IS NOT NULL`;
+            console.log(`Found ${result.recordset.length} tasks in database`);
+            
+            return result.recordset.map(row => row.task_no.toString().trim());
+          } catch (error) {
+            console.error('SQL Error:', error);
+            throw error;
+          } finally {
+            await sql.close();
+          }
+        }
+
+        function searchInGitHistory(taskNumbers) {
+          console.log('Searching in Git history...');
+          const results = [];
+
+          taskNumbers.forEach(taskNo => {
+            try {
+              // Search in commit messages
+              const commitSearch = execSync(
+                `git log --all --grep="${taskNo}" --pretty=format:"%H|%an|%ad|%s" --date=short`,
+                { encoding: 'utf8' }
+              ).trim();
+
+              // Search in branch names
+              const branchSearch = execSync(
+                `git branch -a | grep -i "${taskNo}" || true`,
+                { encoding: 'utf8' }
+              ).trim();
+
+              // Search in file content history
+              const fileSearch = execSync(
+                `git log --all -S"${taskNo}" --pretty=format:"%H|%an|%ad|%s" --date=short || true`,
+                { encoding: 'utf8' }
+              ).trim();
+
+              // Search in current files
+              const currentFileSearch = execSync(
+                `grep -r "${taskNo}" . --exclude-dir=.git --exclude-dir=node_modules || true`,
+                { encoding: 'utf8' }
+              ).trim();
+
+              if (commitSearch || branchSearch || fileSearch || currentFileSearch) {
+                results.push({
+                  taskNo: taskNo,
+                  commits: commitSearch ? commitSearch.split('\n').map(line => {
+                    const [hash, author, date, message] = line.split('|');
+                    return { hash, author, date, message };
+                  }) : [],
+                  branches: branchSearch ? branchSearch.split('\n').filter(b => b.trim()) : [],
+                  fileChanges: fileSearch ? fileSearch.split('\n').map(line => {
+                    const [hash, author, date, message] = line.split('|');
+                    return { hash, author, date, message };
+                  }) : [],
+                  currentFiles: currentFileSearch ? currentFileSearch.split('\n').filter(f => f.trim()) : []
+                });
+              }
+            } catch (error) {
+              console.log(`No Git references found for task: ${taskNo}`);
+            }
+          });
+
+          return results;
+        }
+
+        function searchInMultipleRepos(taskNumbers, additionalRepos = []) {
+          const allResults = [];
+          const currentDir = process.cwd();
+
+          // Search in current repository
+          console.log('Searching in current repository...');
+          const currentRepoResults = searchInGitHistory(taskNumbers);
+          allResults.push({
+            repo: 'current',
+            repoPath: currentDir,
+            results: currentRepoResults
+          });
+
+          // Search in additional repositories
+          additionalRepos.forEach(repoPath => {
+            if (fs.existsSync(repoPath)) {
+              console.log(`Searching in ${repoPath}...`);
+              process.chdir(repoPath);
+              const repoResults = searchInGitHistory(taskNumbers);
+              allResults.push({
+                repo: path.basename(repoPath),
+                repoPath: repoPath,
+                results: repoResults
+              });
+              process.chdir(currentDir);
+            }
+          });
+
+          return allResults;
+        }
+
+        function getJiraUrlFromGit() {
+          try {
+            // Try to extract Jira URL from git remote or git config
+            const remoteUrl = execSync('git remote get-url origin', { encoding: 'utf8' }).trim();
+            
+            // Common patterns for Jira integration
+            if (remoteUrl.includes('github.com')) {
+              // GitHub integration - might have Jira in repository settings
+              return null; // Will be handled in HTML generation
+            }
+            
+            // Try to get from git config if set
+            try {
+              const jiraUrl = execSync('git config --get jira.url', { encoding: 'utf8' }).trim();
+              return jiraUrl;
+            } catch {
+              return null;
+            }
+          } catch {
+            return null;
+          }
+        }
+
+        function generateHTMLReport(searchResults, taskNumbers) {
+          const foundTasks = new Set();
+          searchResults.forEach(repo => {
+            repo.results.forEach(result => {
+              foundTasks.add(result.taskNo);
+            });
+          });
+
+          const notFoundTasks = taskNumbers.filter(task => !foundTasks.has(task));
+          const jiraBaseUrl = getJiraUrlFromGit() || 'https://your-jira-instance.atlassian.net';
+
+          const html = `
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Git-Jira Task Search Results</title>
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    margin: 20px;
+                    background-color: #f5f5f5;
+                }
+                .container {
+                    max-width: 1400px;
+                    margin: 0 auto;
+                    background-color: white;
+                    padding: 20px;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                }
+                .header {
+                    background: linear-gradient(135deg, #0052cc, #0065ff);
+                    color: white;
+                    padding: 20px;
+                    border-radius: 8px;
+                    margin-bottom: 20px;
+                }
+                .summary {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    gap: 15px;
+                    margin-bottom: 30px;
+                }
+                .stat-card {
+                    background-color: #f8f9fa;
+                    padding: 15px;
+                    border-radius: 6px;
+                    border-left: 4px solid #0052cc;
+                }
+                .stat-number {
+                    font-size: 24px;
+                    font-weight: bold;
+                    color: #0052cc;
+                }
+                .repo-section {
+                    margin-bottom: 40px;
+                    border: 1px solid #e1e5e9;
+                    border-radius: 8px;
+                    overflow: hidden;
+                }
+                .repo-header {
+                    background-color: #f6f8fa;
+                    padding: 15px;
+                    border-bottom: 1px solid #e1e5e9;
+                    font-size: 18px;
+                    font-weight: bold;
+                }
+                .task-item {
+                    border-bottom: 1px solid #e1e5e9;
+                    padding: 20px;
+                }
+                .task-item:last-child {
+                    border-bottom: none;
+                }
+                .task-header {
+                    display: flex;
+                    align-items: center;
+                    gap: 15px;
+                    margin-bottom: 15px;
+                }
+                .task-number {
+                    background-color: #0052cc;
+                    color: white;
+                    padding: 8px 12px;
+                    border-radius: 6px;
+                    font-weight: bold;
+                    text-decoration: none;
+                }
+                .task-number:hover {
+                    background-color: #0043a6;
+                }
+                .evidence-section {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                    gap: 20px;
+                    margin-top: 15px;
+                }
+                .evidence-card {
+                    background-color: #f8f9fa;
+                    border-radius: 6px;
+                    padding: 15px;
+                }
+                .evidence-title {
+                    font-weight: bold;
+                    color: #24292e;
+                    margin-bottom: 10px;
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                }
+                .commit-item, .branch-item, .file-item {
+                    background-color: white;
+                    padding: 10px;
+                    margin: 8px 0;
+                    border-radius: 4px;
+                    border-left: 3px solid #28a745;
+                    font-family: 'Courier New', monospace;
+                    font-size: 12px;
+                }
+                .branch-item {
+                    border-left-color: #6f42c1;
+                }
+                .file-item {
+                    border-left-color: #fd7e14;
+                }
+                .commit-hash {
+                    color: #0366d6;
+                    font-weight: bold;
+                }
+                .commit-author {
+                    color: #586069;
+                }
+                .commit-date {
+                    color: #586069;
+                    font-size: 11px;
+                }
+                .not-found {
+                    background-color: #fff5f5;
+                    border: 1px solid #fed7d7;
+                    border-left: 4px solid #e53e3e;
+                    padding: 20px;
+                    margin-top: 30px;
+                    border-radius: 4px;
+                }
+                .not-found h3 {
+                    color: #e53e3e;
+                    margin-top: 0;
+                }
+                .not-found-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+                    gap: 10px;
+                    margin-top: 15px;
+                }
+                .not-found-item {
+                    background-color: #fed7d7;
+                    padding: 8px 12px;
+                    border-radius: 4px;
+                    text-align: center;
+                    font-weight: bold;
+                }
+                .icon {
+                    width: 16px;
+                    height: 16px;
+                    display: inline-block;
+                }
+                .empty-state {
+                    text-align: center;
+                    color: #586069;
+                    font-style: italic;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>🔍 Git-Jira Task Search Results</h1>
+                    <p>Generated on: ${new Date().toLocaleString()}</p>
+                    <p>Searched through Git history, branches, and file contents</p>
+                </div>
+
+                <div class="summary">
+                    <div class="stat-card">
+                        <div class="stat-number">${taskNumbers.length}</div>
+                        <div>Total Tasks from SQL</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">${foundTasks.size}</div>
+                        <div>Found in Git</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">${notFoundTasks.length}</div>
+                        <div>Not Found</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">${searchResults.length}</div>
+                        <div>Repositories Searched</div>
+                    </div>
+                </div>
+
+                ${searchResults.map(repoData => `
+                  <div class="repo-section">
+                    <div class="repo-header">
+                      📁 Repository: ${repoData.repo}
+                      <span style="font-size: 14px; font-weight: normal; color: #586069;">
+                        (${repoData.results.length} tasks found)
+                      </span>
+                    </div>
+                    
+                    ${repoData.results.length === 0 ? 
+                      '<div class="empty-state" style="padding: 40px;">No task references found in this repository</div>' :
+                      repoData.results.map(task => `
+                        <div class="task-item">
+                          <div class="task-header">
+                            <a href="${jiraBaseUrl}/browse/${task.taskNo}" 
+                               class="task-number" 
+                               target="_blank">${task.taskNo}</a>
+                            <span style="color: #586069;">Found in multiple locations</span>
+                          </div>
+                          
+                          <div class="evidence-section">
+                            ${task.commits.length > 0 ? `
+                              <div class="evidence-card">
+                                <div class="evidence-title">
+                                  🔄 Commits (${task.commits.length})
+                                </div>
+                                ${task.commits.slice(0, 5).map(commit => `
+                                  <div class="commit-item">
+                                    <div class="commit-hash">${commit.hash.substring(0, 8)}</div>
+                                    <div>${commit.message}</div>
+                                    <div class="commit-author">${commit.author} • <span class="commit-date">${commit.date}</span></div>
+                                  </div>
+                                `).join('')}
+                                ${task.commits.length > 5 ? `<div style="text-align: center; margin-top: 10px; color: #586069;">... and ${task.commits.length - 5} more commits</div>` : ''}
+                              </div>
+                            ` : ''}
+                            
+                            ${task.branches.length > 0 ? `
+                              <div class="evidence-card">
+                                <div class="evidence-title">
+                                  🌿 Branches (${task.branches.length})
+                                </div>
+                                ${task.branches.map(branch => `
+                                  <div class="branch-item">${branch.trim()}</div>
+                                `).join('')}
+                              </div>
+                            ` : ''}
+                            
+                            ${task.currentFiles.length > 0 ? `
+                              <div class="evidence-card">
+                                <div class="evidence-title">
+                                  📄 Current Files (${task.currentFiles.length})
+                                </div>
+                                ${task.currentFiles.slice(0, 10).map(file => `
+                                  <div class="file-item">${file}</div>
+                                `).join('')}
+                                ${task.currentFiles.length > 10 ? `<div style="text-align: center; margin-top: 10px; color: #586069;">... and ${task.currentFiles.length - 10} more files</div>` : ''}
+                              </div>
+                            ` : ''}
+                          </div>
+                        </div>
+                      `).join('')
+                    }
+                  </div>
+                `).join('')}
+
+                ${notFoundTasks.length > 0 ? `
+                  <div class="not-found">
+                    <h3>❌ Tasks Not Found in Git (${notFoundTasks.length})</h3>
+                    <p>The following task numbers from the SQL database were not found in any Git repositories:</p>
+                    <div class="not-found-grid">
+                      ${notFoundTasks.map(task => `
+                        <div class="not-found-item">
+                          <a href="${jiraBaseUrl}/browse/${task}" target="_blank" style="color: inherit; text-decoration: none;">${task}</a>
+                        </div>
+                      `).join('')}
+                    </div>
+                    <p style="margin-top: 15px; font-size: 14px;">
+                      💡 These tasks might exist in Jira but haven't been referenced in the searched Git repositories yet.
+                    </p>
+                  </div>
+                ` : ''}
+
+                <div style="margin-top: 40px; padding: 20px; background-color: #f6f8fa; border-radius: 8px; font-size: 14px; color: #586069;">
+                  <h4 style="margin-top: 0;">ℹ️ Search Details</h4>
+                  <ul style="margin-bottom: 0;">
+                    <li>Searched commit messages and file changes for task references</li>
+                    <li>Searched branch names containing task numbers</li>
+                    <li>Searched current file contents for task mentions</li>
+                    <li>Click on task numbers to view them in Jira (update the base URL if needed)</li>
+                  </ul>
+                </div>
+            </div>
+        </body>
+        </html>
+          `;
+
+          return html;
+        }
+
+        async function main() {
+          try {
+            console.log('Starting Git-Jira task search process...');
+            
+            // Get tasks from SQL Server
+            const taskNumbers = await getTasksFromSQL();
+            
+            if (taskNumbers.length === 0) {
+              console.log('No tasks found in database');
+              return;
+            }
+
+            // Search in Git repositories
+            const additionalRepos = []; // Add paths to additional repos if needed
+            const searchResults = searchInMultipleRepos(taskNumbers, additionalRepos);
+
+            // Generate HTML report
+            const htmlReport = generateHTMLReport(searchResults, taskNumbers);
+
+            // Save HTML report
+            fs.writeFileSync('git-jira-search-results.html', htmlReport);
+            console.log('HTML report generated: git-jira-search-results.html');
+
+            // Also save JSON for potential further processing
+            fs.writeFileSync('git-jira-search-results.json', JSON.stringify({
+              searchResults,
+              taskNumbers,
+              timestamp: new Date().toISOString()
+            }, null, 2));
+
+            const totalFound = searchResults.reduce((sum, repo) => sum + repo.results.length, 0);
+            console.log(`Process completed successfully!`);
+            console.log(`- Total tasks from SQL: ${taskNumbers.length}`);
+            console.log(`- Found in Git: ${totalFound}`);
+            console.log(`- Not found: ${taskNumbers.length - totalFound}`);
+            console.log(`- Repositories searched: ${searchResults.length}`);
+
+          } catch (error) {
+            console.error('Process failed:', error);
+            process.exit(1);
+          }
+        }
+
+        main();
+        EOF
+
+    - name: Run Git-Jira search
+      env:
+        SQL_USERNAME: ${{ secrets.SQL_USERNAME }}
+        SQL_PASSWORD: ${{ secrets.SQL_PASSWORD }}
+      run: node search-git-jira-tasks.js
+
+    - name: Upload HTML report as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: git-jira-search-results
+        path: |
+          git-jira-search-results.html
+          git-jira-search-results.json
+        retention-days: 30
+
+    - name: Upload to GitHub Pages (optional)
+      if: github.ref == 'refs/heads/main'
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: .
+        destination_dir: reports
+        keep_files: true
