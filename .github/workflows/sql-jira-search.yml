@@ -7,8 +7,8 @@ on:
     - cron: '0 9 * * 1-5'  # Run at 9 AM on weekdays
 
 env:
-  SQL_SERVER: "ri70-sql"
-  DATABASE: "t3"
+  SQL_SERVER: "RI70-SQL"
+  DATABASE: "T3"
   TABLE_NAME: "tmp_tasks"
 
 jobs:
